@@ -4,7 +4,7 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const { Server } = require('socket.io');
 const http = require('http');
-const OneSignal = require('onesignal-node');
+const https = require('https');
 const { Pool } = require('pg');
 const { PrismaPg } = require('@prisma/adapter-pg');
 
@@ -20,11 +20,51 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
-// OneSignal Client Initialization
-const oneSignalClient = new OneSignal.Client(
-  process.env.ONESIGNAL_APP_ID,
-  process.env.ONESIGNAL_REST_API_KEY
-);
+// OneSignal: send push notification directly via REST API
+function sendOneSignalPush(playerIds, message, heading = 'Order Update', data = null) {
+  return new Promise((resolve, reject) => {
+    const payload = {
+      app_id: process.env.ONESIGNAL_APP_ID,
+      include_player_ids: playerIds,
+      contents: { en: message },
+      headings: { en: heading },
+    };
+    if (data) {
+      payload.data = data;
+      if (data.orderId) {
+        payload.android_group = data.orderId;
+        payload.collapse_id = data.orderId;
+      }
+    }
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: 'onesignal.com',
+      port: 443,
+      path: '/api/v1/notifications',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Key ${process.env.ONESIGNAL_REST_API_KEY}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ... skipped ...
+
+// In app.post('/api/orders') handler:
+// Broadcast new order to Admin Kitchen Dashboard instantly
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -55,12 +95,34 @@ app.post('/api/categories', async (req, res) => {
   const { name, icon } = req.body;
   try {
     const newCategory = await prisma.category.create({
-      data: { name, icon }
+      data: { 
+        name, 
+        icon: icon || 'fast-food-outline' 
+      }
     });
+    io.emit('menu_updated');
     res.status(201).json(newCategory);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
+app.delete('/api/categories/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Delete any menu items belonging to this category first (to avoid FK errors)
+    // Actually, since menu items have order items, this might get complicated if there are orders.
+    // For safety, let's just attempt to delete the category. If it has menu items, Prisma will throw,
+    // which is the correct safe behavior.
+    await prisma.category.delete({
+      where: { id }
+    });
+    io.emit('menu_updated');
+    res.status(200).json({ message: 'Category deleted successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to delete category (Ensure it is empty first)' });
   }
 });
 
@@ -171,24 +233,31 @@ app.post('/api/orders', async (req, res) => {
     // Broadcast new order to Admin Kitchen Dashboard instantly
     io.emit('new_order', order);
     
-    // Send Push Notification to all registered Admin devices
+    // Send Push Notification to all registered Admin devices (Admins have customerId = null)
     try {
-      const devices = await prisma.device.findMany();
+      const devices = await prisma.device.findMany({
+        where: { customerId: null }
+      });
       const playerIds = devices.map(d => d.playerId).filter(Boolean);
       
       if (playerIds.length > 0) {
         const itemNames = order.items.map(i => `${i.quantity}x ${i.menuItem.name}`).join(', ');
-        const notification = {
-          contents: {
-            'en': `Table ${order.tableNumber} - ${order.customerName || 'Guest'}\nItems: ${itemNames}`,
-          },
-          headings: {
-            'en': `New Order! ($${order.totalPrice.toFixed(2)})`
-          },
-          include_subscription_ids: playerIds,
-        };
-        await oneSignalClient.createNotification(notification);
-        console.log(`  -> Sent new order push notification to ${playerIds.length} admins`);
+        try {
+          sendOneSignalPush(
+            playerIds,
+            `Table ${order.tableNumber} - ${order.customerName || 'Guest'}\nItems: ${itemNames}`,
+            `New Order! ($${order.totalPrice.toFixed(2)})`,
+            { orderId: order.id }
+          ).then(result => {
+            const fs = require('fs');
+            fs.appendFileSync('devices.log', `[PUSH ADMIN] Response: ${JSON.stringify(result)}\n`);
+          }).catch(notifError => {
+            const fs = require('fs');
+            fs.appendFileSync('devices.log', `[PUSH ADMIN] ERROR: ${notifError}\n`);
+          });
+        } catch (notifError) {
+          console.error('  -> Failed to send push to admins:', notifError);
+        }
       }
     } catch (notifError) {
       console.error('  -> Failed to send push notification to admins', notifError);
@@ -206,9 +275,6 @@ app.put('/api/orders/:id/status', async (req, res) => {
   const { status } = req.body;
   
   try {
-    // Workaround for the compiled Admin APK: The APK's collectPayment function 
-    // attempts to set payment to paid (which was empty) and then sets status to 'Order Placed'.
-    // We intercept this and update the paymentStatus here.
     let paymentStatusUpdate = undefined;
     if (status === 'Order Placed') {
       paymentStatusUpdate = 'paid';
@@ -227,25 +293,52 @@ app.put('/api/orders/:id/status', async (req, res) => {
     // Broadcast status change to Kitchen Dashboard
     io.emit('order_updated', updatedOrder);
 
-    // If order is Ready, send Push Notification to customer
-    if (status === 'Ready' && updatedOrder.customerId) {
-      const device = await prisma.device.findFirst({
-        where: { id: updatedOrder.customerId }
-      });
-      
-      if (device && device.playerId) {
-        const notification = {
-          contents: {
-            'en': `Your order for Table ${updatedOrder.tableNumber} is ready for pickup!`,
-          },
-          include_subscription_ids: [device.playerId],
-        };
-        await oneSignalClient.createNotification(notification);
+    // If order is Accepted or Ready, send Push Notification to customer
+    if (status === 'Accepted' || status === 'Ready') {
+      console.log(`[PUSH] Status changed to "${status}" for order ${id}`);
+      console.log(`[PUSH] Order customerId: ${updatedOrder.customerId || 'NULL - customer has no ID stored!'}`);
+
+      if (!updatedOrder.customerId) {
+        console.warn(`[PUSH] SKIPPING: No customerId on order. Customer may not have logged in properly.`);
+      } else {
+        // Find ALL devices for this customer (they may have multiple browsers)
+        const devices = await prisma.device.findMany({
+          where: { customerId: updatedOrder.customerId }
+        });
+
+        console.log(`[PUSH] Found ${devices.length} device(s) for customerId "${updatedOrder.customerId}"`);
+        devices.forEach(d => console.log(`[PUSH]   -> playerId: ${d.playerId}`));
+
+        if (devices.length === 0) {
+          console.warn(`[PUSH] SKIPPING: No devices registered for this customer. They may not have granted notification permission.`);
+        } else {
+          const playerIds = devices.map(d => d.playerId);
+          let message = '';
+          if (status === 'Accepted') message = 'Your order has been accepted.';
+          if (status === 'Ready') message = 'Your order is ready!';
+
+          console.log(`[PUSH] Sending notification: "${message}" to playerIds: ${JSON.stringify(playerIds)}`);
+
+          try {
+            sendOneSignalPush(playerIds, message, 'Order Status', { orderId: updatedOrder.id })
+              .then(result => {
+                const fs = require('fs');
+                fs.appendFileSync('devices.log', `[PUSH CUST] Response: ${JSON.stringify(result)}\n`);
+              })
+              .catch(pushErr => {
+                const fs = require('fs');
+                fs.appendFileSync('devices.log', `[PUSH CUST] ERROR: ${pushErr.message || pushErr}\n`);
+              });
+          } catch (pushErr) {
+            console.error(`[PUSH] ERROR from OneSignal:`, pushErr.message || pushErr);
+          }
+        }
       }
     }
 
     res.json(updatedOrder);
   } catch (error) {
+    console.error('Failed to update order status:', error);
     res.status(500).json({ error: 'Failed to update order status' });
   }
 });
@@ -310,18 +403,38 @@ app.delete('/api/tables/:id', async (req, res) => {
   }
 });
 
-// 3. Devices (For Push Notifications)
+// OneSignal Device Registration
+const fs = require('fs');
 app.post('/api/devices', async (req, res) => {
-  const { playerId } = req.body;
+  const logMsg = `\n[${new Date().toISOString()}] /api/devices CALLED\nBody: ${JSON.stringify(req.body)}\n`;
+  console.log(logMsg);
+  fs.appendFileSync('devices.log', logMsg);
+
+  const { playerId, customerId } = req.body;
+  if (!playerId) {
+    fs.appendFileSync('devices.log', 'ERROR: Missing playerId\n');
+    return res.status(400).json({ error: 'playerId is required' });
+  }
+
   try {
+    const data = { playerId };
+    // Only link customerId if it's provided and not a string "null" or "undefined"
+    if (customerId && customerId !== 'null' && customerId !== 'undefined') {
+      data.customerId = customerId;
+    }
+
     const device = await prisma.device.upsert({
       where: { playerId },
-      update: {},
-      create: { playerId }
+      update: data,
+      create: data,
     });
+    
+    console.log('SUCCESS: Device saved to DB:', device);
     res.json(device);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to register device' });
+    console.error('ERROR saving device to DB:', error);
+    fs.appendFileSync('devices.log', `ERROR saving device to DB: ${error.message}\n`);
+    res.status(500).json({ error: 'Failed to register device', details: error.message, stack: error.stack });
   }
 });
 
@@ -335,10 +448,53 @@ io.on('connection', (socket) => {
   });
 });
 
-// Serve Angular App
-app.use(express.static(path.join(__dirname, 'www')));
+app.get('/api/debug-devices', async (req, res) => {
+  try {
+    const devices = await prisma.device.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20
+    });
+    res.json({ count: devices.length, devices });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/debug-log', (req, res) => {
+  try {
+    const fs = require('fs');
+    if (fs.existsSync('devices.log')) {
+      res.type('text/plain').send(fs.readFileSync('devices.log', 'utf8'));
+    } else {
+      res.send('Log file does not exist yet.');
+    }
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Debug page for OneSignal diagnostics
+app.get('/debug-push', (req, res) => {
+  res.sendFile(path.join(__dirname, 'onesignal-debug.html'));
+});
+
+// Serve Angular App with no-cache headers to prevent aggressive Safari caching
+const noCacheOptions = {
+  setHeaders: (res, path) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
+};
+app.use(express.static(path.join(__dirname, 'www'), noCacheOptions));
+
 app.use((req, res, next) => {
   if (req.method === 'GET' && !req.path.startsWith('/api')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
     res.sendFile(path.join(__dirname, 'www', 'index.html'));
   } else {
     next();
