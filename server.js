@@ -194,6 +194,23 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
+app.get('/api/orders/table/:tableNumber/latest', async (req, res) => {
+  const { tableNumber } = req.params;
+  try {
+    const order = await prisma.order.findFirst({
+      where: { 
+        tableNumber,
+        status: { notIn: ['Paid', 'Completed', 'Cancelled'] }
+      },
+      orderBy: { createdAt: 'desc' },
+      include: { items: { include: { menuItem: true } } }
+    });
+    res.json(order || null);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch table latest order' });
+  }
+});
+
 app.get('/api/orders/customer/:customerId/latest', async (req, res) => {
   const { customerId } = req.params;
   try {
@@ -467,7 +484,17 @@ app.get('/api/debug-log', (req, res) => {
       res.type('text/plain').send(fs.readFileSync('devices.log', 'utf8'));
     } else {
       res.send('Log file does not exist yet.');
-    }
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+app.post('/api/telemetry', express.json(), (req, res) => {
+  try {
+    const fs = require('fs');
+    const logLine = `[${new Date().toISOString()}] ${req.body.message}\n`;
+    fs.appendFileSync('telemetry.log', logLine);
+    res.send({ success: true });
   } catch (error) {
     res.status(500).send(error.message);
   }
