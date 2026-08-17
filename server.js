@@ -484,6 +484,7 @@ app.get('/api/debug-log', (req, res) => {
       res.type('text/plain').send(fs.readFileSync('devices.log', 'utf8'));
     } else {
       res.send('Log file does not exist yet.');
+    }
   } catch (error) {
     res.status(500).send(error.message);
   }
