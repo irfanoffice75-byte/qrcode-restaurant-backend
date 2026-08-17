@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "node unzip.js && npx prisma generate",
-    "start": "npx prisma db push --accept-data-loss && node server.js"
+    "build": "node unzip.js && npx prisma generate && npx prisma db push --accept-data-loss",
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
